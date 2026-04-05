@@ -833,7 +833,7 @@ const ModernTimeDisplay = () => {
 
 export function SyncedVideoPlayer({ 
   onMenuOpen, 
-  initialChannelId = '',
+  initialChannelId = CHANNELS[0].id,
   onChannelChange,
   showStartModal = false,
   onStartClick,
@@ -924,10 +924,6 @@ export function SyncedVideoPlayer({
   const hasAutoStartedRef = useRef(false)
   const playbackRecoveryTimeoutRef = useRef<NodeJS.Timeout | null>(null)
   const lastPlayerStateRef = useRef<number>(YT_STATE.UNSTARTED)
-  const playbackRecoveryAttemptsRef = useRef(0)
-  const overlayShownAtRef = useRef(0)
-  const overlayHideTimeoutRef = useRef<NodeJS.Timeout | null>(null)
-  const lastOverlayShowAtRef = useRef(0)
   // "Latest value" refs — used inside syncWithServer so we don't need those values
   // in the useCallback dependency array (which would reset the 5-min interval on each video change)
   const currentProgramRef = useRef<VideoProgram | null>(null)
@@ -965,40 +961,18 @@ export function SyncedVideoPlayer({
     }
   }, [])
 
-  const clearOverlayHideTimer = useCallback(() => {
-    if (overlayHideTimeoutRef.current) {
-      clearTimeout(overlayHideTimeoutRef.current)
-      overlayHideTimeoutRef.current = null
+  const normalizeStartTime = useCallback((seekTo?: number, duration?: number): number => {
+    const safeSeek = typeof seekTo === 'number' && Number.isFinite(seekTo) ? Math.floor(seekTo) : 0
+    const safeDuration = typeof duration === 'number' && Number.isFinite(duration) ? Math.floor(duration) : 0
+
+    if (safeDuration <= 0) {
+      return Math.max(0, safeSeek)
     }
+
+    // Clamp seek so a boundary/timing race cannot request an invalid/end-of-video start.
+    const maxStart = Math.max(0, safeDuration - 2)
+    return Math.max(0, Math.min(safeSeek, maxStart))
   }, [])
-
-  const showPlaybackOverlay = useCallback((programName?: string) => {
-    if (programName) {
-      brandedOverlayProgramRef.current = programName
-    }
-
-    const now = Date.now()
-    if (showBrandedOverlay && now - lastOverlayShowAtRef.current < 1000) {
-      return
-    }
-
-    lastOverlayShowAtRef.current = now
-    overlayShownAtRef.current = now
-    clearOverlayHideTimer()
-    setShowBrandedOverlay(true)
-  }, [showBrandedOverlay, clearOverlayHideTimer])
-
-  const hidePlaybackOverlay = useCallback((minVisibleMs: number = 3200) => {
-    clearOverlayHideTimer()
-
-    const elapsed = Date.now() - overlayShownAtRef.current
-    const waitMs = Math.max(0, minVisibleMs - elapsed)
-
-    overlayHideTimeoutRef.current = setTimeout(() => {
-      if (!mountedRef.current) return
-      setShowBrandedOverlay(false)
-    }, waitMs)
-  }, [clearOverlayHideTimer])
 
   const schedulePlaybackRecovery = useCallback((reason: string) => {
     clearPlaybackRecoveryTimer()
@@ -1007,40 +981,26 @@ export function SyncedVideoPlayer({
       if (!mountedRef.current) return
       if (lastPlayerStateRef.current === YT_STATE.PLAYING) return
 
-      const targetProgram = currentProgramRef.current ?? currentProgram
-      if (!targetProgram) return
+      const activeProgram = currentProgramRef.current
+      if (!activeProgram) return
 
-      if (playbackRecoveryAttemptsRef.current >= 2) {
-        console.error(`❌ Playback recovery exceeded retry limit (${reason})`)
-        setIsLoading(false)
-        setShowStartScreen(false)
-        isTransitioningRef.current = false
-        setApiError('Playback stalled after reload. Please tap Reload once.')
-        hidePlaybackOverlay(0)
-        return
-      }
-
-      playbackRecoveryAttemptsRef.current += 1
-
-      const resumeAt = Math.max(0, Math.floor(getCurrentTime()))
+      const durationHint = getDuration() || activeProgram.duration
+      const resumeAt = normalizeStartTime(getCurrentTime(), durationHint)
       console.warn(`⚠️ Playback recovery triggered (${reason}) at ${resumeAt}s`)
 
       // Keep UX responsive while we recover playback in-place.
       setIsLoading(false)
       setShowStartScreen(false)
-      showPlaybackOverlay(targetProgram.title)
+      setShowBrandedOverlay(true)
 
-      const reloaded = loadVideo(targetProgram.videoId, resumeAt)
+      const reloaded = loadVideo(activeProgram.videoId, resumeAt)
       if (reloaded) {
         setYouTubeVolume(volume)
         setYouTubeMuted(isMuted)
-        play()
-      } else {
-        setApiError('Playback reload failed. Please tap Reload once.')
-        hidePlaybackOverlay(0)
       }
+      play()
     }, 12000)
-  }, [clearPlaybackRecoveryTimer, currentProgram, getCurrentTime, hidePlaybackOverlay, isMuted, loadVideo, play, setYouTubeMuted, setYouTubeVolume, showPlaybackOverlay, volume])
+  }, [clearPlaybackRecoveryTimer, getCurrentTime, getDuration, isMuted, loadVideo, normalizeStartTime, play, setYouTubeMuted, setYouTubeVolume, volume])
 
   // ── Helper: build schedule array from current state and notify parent ──
   // Deduplicates: ensures the currently-playing video never also appears in upcoming.
@@ -1122,12 +1082,12 @@ export function SyncedVideoPlayer({
     isTransitioningRef.current = true
     clearPlaybackRecoveryTimer()
     lastPlayerStateRef.current = YT_STATE.BUFFERING
-    playbackRecoveryAttemptsRef.current = 0
     
     console.log('▶️ Playing next video:', nextProgram.title)
     
     // Show branded overlay during loading transition
-    showPlaybackOverlay(nextProgram.title)
+    brandedOverlayProgramRef.current = nextProgram.title
+    setShowBrandedOverlay(true)
     
     // Add current video to previous list
     if (currentProgram) {
@@ -1236,7 +1196,7 @@ export function SyncedVideoPlayer({
       isTransitioningRef.current = false
     }
     
-  }, [currentProgram, nextProgram, currentChannelId, upcomingVideos, loadVideo, volume, isMuted, setYouTubeVolume, setYouTubeMuted, play, getDuration, notifyParentScheduleChange, clearPlaybackRecoveryTimer, schedulePlaybackRecovery, showPlaybackOverlay])
+  }, [currentProgram, nextProgram, currentChannelId, upcomingVideos, loadVideo, volume, isMuted, setYouTubeVolume, setYouTubeMuted, play, getDuration, notifyParentScheduleChange, clearPlaybackRecoveryTimer, schedulePlaybackRecovery])
 
   // Keep playNextVideoRef always pointing at the freshest closure.
   // onStateChange (ENDED) and updateTimeDisplay both call this so they always
@@ -1264,6 +1224,7 @@ export function SyncedVideoPlayer({
       // Check if video is near the end (less than 0.5 seconds remaining)
       if (actualDuration > 0 && remaining <= 0.5 && !isTransitioningRef.current && nextProgram) {
         console.log('⚠️ Video ending soon, preparing next video...')
+        setShowBrandedOverlay(true)
         setIsLoading(false)
         setShowStartScreen(false)
         
@@ -1420,14 +1381,11 @@ export function SyncedVideoPlayer({
   // Keep the ref in sync with the latest closure
   useEffect(() => { syncImmediateAfterTransitionRef.current = syncImmediateAfterTransition }, [syncImmediateAfterTransition])
 
-  const loadChannel = useCallback(async (channelId: string, options?: { force?: boolean }) => {
-    if (isLoading && !options?.force) return
+  const loadChannel = useCallback(async (channelId: string) => {
+    if (isLoading) return
     
     setIsLoading(true)
     setApiError(null)
-    clearPlaybackRecoveryTimer()
-    playbackRecoveryAttemptsRef.current = 0
-    lastPlayerStateRef.current = YT_STATE.UNSTARTED
     setCurrentChannelId(channelId)
     onChannelChange?.(channelId)
     
@@ -1483,14 +1441,14 @@ export function SyncedVideoPlayer({
         thumbnail: `https://img.youtube.com/vi/${result.currentProgram.ytVideoId}/maxresdefault.jpg`
       }
       
-      const startTime = result.currentProgram.seekTo
-      const timeRemaining = result.currentProgram.duration - result.currentProgram.seekTo
+      const startTime = normalizeStartTime(result.currentProgram.seekTo, result.currentProgram.duration)
+      const timeRemaining = Math.max(0, program.duration - startTime)
       
       brandedOverlayProgramRef.current = program.title
 
       setIsLoading(false)
       setShowStartScreen(false)
-      showPlaybackOverlay(program.title)
+      setShowBrandedOverlay(true)
       setCurrentProgram(program)
       currentProgramRef.current = program
       setCurrentTime(startTime)
@@ -1566,7 +1524,6 @@ export function SyncedVideoPlayer({
       }
       
       lastVideoIdRef.current = program.videoId
-      schedulePlaybackRecovery('channel-bootstrap')
       
       // No branded overlay on initial channel load — only on video transitions (playNextVideo)
       
@@ -1687,7 +1644,7 @@ export function SyncedVideoPlayer({
             console.log('🎬 🍎 iOS state changed:', state)
             if (state === YT_STATE.ENDED) {
               clearPlaybackRecoveryTimer()
-              showPlaybackOverlay(nextProgram?.title)
+              setShowBrandedOverlay(true)
               setIsLoading(false)
               setShowStartScreen(false)
               if (videoEndTimeoutRef.current) clearTimeout(videoEndTimeoutRef.current)
@@ -1695,19 +1652,19 @@ export function SyncedVideoPlayer({
             } else if (state === YT_STATE.PLAYING) {
               console.log('▶️ 🍎 Real video is PLAYING on iOS')
               clearPlaybackRecoveryTimer()
-              playbackRecoveryAttemptsRef.current = 0
               isTransitioningRef.current = false
               setIsLoading(false)
               setShowStartScreen(false)
               setPlayerReady(true)
               setIframeVisible(true) // Reveal iframe — real video is now rendering
-              setYouTubeMuted(false)
               setIsMuted(false)
               onStartClick?.()
-              hidePlaybackOverlay(3200)
+              setTimeout(() => setShowBrandedOverlay(false), 3000)
             } else if (state === YT_STATE.PAUSED) {
               // iOS sometimes auto-pauses; resume
               play()
+            } else if (state === YT_STATE.UNSTARTED) {
+              schedulePlaybackRecovery('ios-unstarted')
             } else if (state === YT_STATE.BUFFERING) {
               console.log('⏳ 🍎 Buffering...')
               schedulePlaybackRecovery('ios-buffering')
@@ -1782,7 +1739,7 @@ export function SyncedVideoPlayer({
               clearPlaybackRecoveryTimer()
               console.log('📺 22 Video ended event received - playing next')
               // setIsLoading(true)
-              showPlaybackOverlay(nextProgram?.title)
+              setShowBrandedOverlay(true)
               setIsLoading(false)
               setShowStartScreen(false)
               if (videoEndTimeoutRef.current) {
@@ -1793,20 +1750,19 @@ export function SyncedVideoPlayer({
             } else if (state === YT_STATE.PLAYING) {
               console.log('▶️ 22 Video is now playing')
               clearPlaybackRecoveryTimer()
-              playbackRecoveryAttemptsRef.current = 0
               isTransitioningRef.current = false
               setIsLoading(false);
               setIframeVisible(true)
-              if (!isIOS) {
-                setYouTubeMuted(false)
-                setYouTubeVolume(volume)
-              }
               setIsMuted(false)
-              hidePlaybackOverlay(3200)
+              setTimeout(() => {
+                setShowBrandedOverlay(false) // Hide branded overlay when playback starts
+              }, 3000);
               
             } else if (state === YT_STATE.PAUSED) {
               console.log('⏸️ 22 Video paused - resuming')
               play()
+            } else if (state === YT_STATE.UNSTARTED) {
+              schedulePlaybackRecovery('web-unstarted')
             } else if (state === YT_STATE.BUFFERING) {
               console.log('⏳ 22 Video buffering...')
               schedulePlaybackRecovery('web-buffering')
@@ -1841,11 +1797,10 @@ export function SyncedVideoPlayer({
       console.error('API call failed:', error)
       clearPlaybackRecoveryTimer()
       isTransitioningRef.current = false
-      hidePlaybackOverlay(0)
       setApiError(error instanceof Error ? error.message : 'Failed to load video')
       setIsLoading(false)
     }
-  }, [isLoading, playerReady, isPrimedRef, volume, initializePlayer, loadVideo, seekTo, play, setYouTubeVolume, setYouTubeMuted, onChannelChange, onStartClick, getDuration, fetchFromBrowserAPI, notifyParentScheduleChange, setPlayerCallbacks, schedulePlaybackRecovery, clearPlaybackRecoveryTimer, showPlaybackOverlay, hidePlaybackOverlay, nextProgram, isIOS])
+  }, [isLoading, playerReady, isPrimedRef, volume, initializePlayer, loadVideo, seekTo, play, setYouTubeVolume, setYouTubeMuted, onChannelChange, onStartClick, getDuration, fetchFromBrowserAPI, notifyParentScheduleChange, setPlayerCallbacks, schedulePlaybackRecovery, clearPlaybackRecoveryTimer])
 
   // Auto-load on web/android: iOS keeps explicit Start button.
   useEffect(() => {
@@ -2040,7 +1995,7 @@ export function SyncedVideoPlayer({
             channelId: currentChannelId,
             thumbnail: `https://img.youtube.com/vi/${apiCurrentId}/maxresdefault.jpg`
           }
-          const seekOffset = result.currentProgram.seekTo || 0
+          const seekOffset = normalizeStartTime(result.currentProgram.seekTo, result.currentProgram.duration)
           const remaining = result.currentProgram.duration - seekOffset
 
           // 3. Update all player state to reflect the new current program
@@ -2110,13 +2065,12 @@ export function SyncedVideoPlayer({
     } catch (error) {
       console.error('Sync failed:', error)
     }
-  }, [playerReady, currentChannelId, fetchFromBrowserAPI, notifyParentScheduleChange, loadVideo, play])
+  }, [playerReady, currentChannelId, fetchFromBrowserAPI, notifyParentScheduleChange, loadVideo, play, normalizeStartTime])
 
   const handleReload = useCallback(() => {
     if (!currentChannelId) return
     console.log('🔄 Reloading channel:', currentChannelId)
     clearPlaybackRecoveryTimer()
-    playbackRecoveryAttemptsRef.current = 0
     isTransitioningRef.current = false
     
     // Save currently-playing video to history BEFORE reload so it appears in the list
@@ -2127,18 +2081,16 @@ export function SyncedVideoPlayer({
     
     // Reset player state only — do NOT touch previousVideos or localStorage
     setPlayerReady(false)
-    setIsLoading(false)
     setCurrentProgram(null)
     setApiError(null)
     setIframeVisible(false) // hide iframe until next real PLAYING event
-    hidePlaybackOverlay(0)
     // destroy()
     
     // Reload same channel — previousVideos state and localStorage are preserved
     setTimeout(() => {
-      loadChannel(currentChannelId, { force: true })
+      loadChannel(currentChannelId)
     }, 200)
-  }, [destroy, currentChannelId, currentProgram, loadChannel, clearPlaybackRecoveryTimer, hidePlaybackOverlay])
+  }, [destroy, currentChannelId, currentProgram, loadChannel, clearPlaybackRecoveryTimer])
 
   // Trigger reload when parent increments the counter (e.g. Reload menu option)
   useEffect(() => {
@@ -2153,11 +2105,11 @@ export function SyncedVideoPlayer({
     if (!currentChannelId || !playerReady || isTransitioningRef.current) return
     
     isTransitioningRef.current = true
-    playbackRecoveryAttemptsRef.current = 0
     
     console.log('▶️ Playing from previous list:', video.title)
     
-    showPlaybackOverlay(video.title)
+    brandedOverlayProgramRef.current = video.title
+    setShowBrandedOverlay(true)
     
     // Add current video to previous before switching
     if (currentProgram) {
@@ -2191,7 +2143,7 @@ export function SyncedVideoPlayer({
     const loaded = loadVideo(video.videoId, 0)
     if (!loaded) {
       isTransitioningRef.current = false
-      hidePlaybackOverlay(0)
+      setShowBrandedOverlay(false)
       return
     }
     
@@ -2200,7 +2152,7 @@ export function SyncedVideoPlayer({
       schedulePlaybackRecovery('play-from-history')
     }, 200)
     
-  }, [currentChannelId, playerReady, currentProgram, loadVideo, play, schedulePlaybackRecovery, showPlaybackOverlay, hidePlaybackOverlay])
+  }, [currentChannelId, playerReady, currentProgram, loadVideo, play, schedulePlaybackRecovery])
 
   // Fullscreen handlers
   const handleFullscreen = async () => {
@@ -2299,7 +2251,6 @@ export function SyncedVideoPlayer({
     return () => {
       mountedRef.current = false
       clearPlaybackRecoveryTimer()
-      clearOverlayHideTimer()
       if (syncIntervalRef.current) {
         clearInterval(syncIntervalRef.current)
       }
@@ -2311,7 +2262,7 @@ export function SyncedVideoPlayer({
       }
       //destroy()
     }
-  }, [destroy, clearPlaybackRecoveryTimer, clearOverlayHideTimer])
+  }, [destroy, clearPlaybackRecoveryTimer])
 
   const handleVolumeChange = useCallback((value: number[]) => {
     const newVolume = value[0]
