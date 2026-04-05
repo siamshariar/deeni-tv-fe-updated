@@ -922,6 +922,8 @@ export function SyncedVideoPlayer({
   const videoEndTimeoutRef = useRef<NodeJS.Timeout | null>(null)
   const isTransitioningRef = useRef(false)
   const hasAutoStartedRef = useRef(false)
+  const playbackRecoveryTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const lastPlayerStateRef = useRef<number>(YT_STATE.UNSTARTED)
   // "Latest value" refs — used inside syncWithServer so we don't need those values
   // in the useCallback dependency array (which would reset the 5-min interval on each video change)
   const currentProgramRef = useRef<VideoProgram | null>(null)
@@ -951,6 +953,37 @@ export function SyncedVideoPlayer({
     play,
     destroy
   } = useYouTubePlayer()
+
+  const clearPlaybackRecoveryTimer = useCallback(() => {
+    if (playbackRecoveryTimeoutRef.current) {
+      clearTimeout(playbackRecoveryTimeoutRef.current)
+      playbackRecoveryTimeoutRef.current = null
+    }
+  }, [])
+
+  const schedulePlaybackRecovery = useCallback((reason: string) => {
+    clearPlaybackRecoveryTimer()
+
+    playbackRecoveryTimeoutRef.current = setTimeout(() => {
+      if (!mountedRef.current || !currentProgram) return
+      if (lastPlayerStateRef.current === YT_STATE.PLAYING) return
+
+      const resumeAt = Math.max(0, Math.floor(getCurrentTime()))
+      console.warn(`⚠️ Playback recovery triggered (${reason}) at ${resumeAt}s`)
+
+      // Keep UX responsive while we recover playback in-place.
+      setIsLoading(false)
+      setShowStartScreen(false)
+      setShowBrandedOverlay(true)
+
+      const reloaded = loadVideo(currentProgram.videoId, resumeAt)
+      if (reloaded) {
+        setYouTubeVolume(volume)
+        setYouTubeMuted(isMuted)
+      }
+      play()
+    }, 12000)
+  }, [clearPlaybackRecoveryTimer, currentProgram, getCurrentTime, isMuted, loadVideo, play, setYouTubeMuted, setYouTubeVolume, volume])
 
   // ── Helper: build schedule array from current state and notify parent ──
   // Deduplicates: ensures the currently-playing video never also appears in upcoming.
@@ -1030,6 +1063,8 @@ export function SyncedVideoPlayer({
     }
     
     isTransitioningRef.current = true
+    clearPlaybackRecoveryTimer()
+    lastPlayerStateRef.current = YT_STATE.BUFFERING
     
     console.log('▶️ Playing next video:', nextProgram.title)
     
@@ -1123,7 +1158,7 @@ export function SyncedVideoPlayer({
       // TODO: Is this delay mandatory??
       play()
       console.log('▶️ Playing next video now')
-      isTransitioningRef.current = false
+      schedulePlaybackRecovery('next-video-transition')
       
       // Get duration from YouTube API
       const duration = getDuration()
@@ -1140,10 +1175,11 @@ export function SyncedVideoPlayer({
       }, 500)
     } else {
       console.error('❌ Failed to load next video')
+      clearPlaybackRecoveryTimer()
       isTransitioningRef.current = false
     }
     
-  }, [currentProgram, nextProgram, currentChannelId, upcomingVideos, loadVideo, volume, isMuted, setYouTubeVolume, setYouTubeMuted, play, getDuration, notifyParentScheduleChange])
+  }, [currentProgram, nextProgram, currentChannelId, upcomingVideos, loadVideo, volume, isMuted, setYouTubeVolume, setYouTubeMuted, play, getDuration, notifyParentScheduleChange, clearPlaybackRecoveryTimer, schedulePlaybackRecovery])
 
   // Keep playNextVideoRef always pointing at the freshest closure.
   // onStateChange (ENDED) and updateTimeDisplay both call this so they always
@@ -1586,8 +1622,10 @@ export function SyncedVideoPlayer({
           },
           onStateChange: (state: number) => {
             if (!mountedRef.current) return
+            lastPlayerStateRef.current = state
             console.log('🎬 🍎 iOS state changed:', state)
             if (state === YT_STATE.ENDED) {
+              clearPlaybackRecoveryTimer()
               setShowBrandedOverlay(true)
               setIsLoading(false)
               setShowStartScreen(false)
@@ -1595,6 +1633,8 @@ export function SyncedVideoPlayer({
               playNextVideoRef.current()
             } else if (state === YT_STATE.PLAYING) {
               console.log('▶️ 🍎 Real video is PLAYING on iOS')
+              clearPlaybackRecoveryTimer()
+              isTransitioningRef.current = false
               setIsLoading(false)
               setShowStartScreen(false)
               setPlayerReady(true)
@@ -1607,7 +1647,9 @@ export function SyncedVideoPlayer({
               play()
             } else if (state === YT_STATE.BUFFERING) {
               console.log('⏳ 🍎 Buffering...')
+              schedulePlaybackRecovery('ios-buffering')
             } else if (state === YT_STATE.CUED) {
+              schedulePlaybackRecovery('ios-cued')
               play()
             }
           },
@@ -1616,6 +1658,8 @@ export function SyncedVideoPlayer({
           },
           onError: (code: number, msg: string) => {
             console.error('🍎 Player error:', code, msg)
+            clearPlaybackRecoveryTimer()
+            isTransitioningRef.current = false
             if (code === 2 || code === 5 || code === 100) {
               setApiError(`Playback error: ${msg}`)
             }
@@ -1631,8 +1675,11 @@ export function SyncedVideoPlayer({
           setYouTubeVolume(volume)
           setYouTubeMuted(false)
           setIsMuted(false)
+          schedulePlaybackRecovery('ios-primer-load')
         } else {
           console.error('❌ 🍎 loadVideo failed on primed player')
+          clearPlaybackRecoveryTimer()
+          isTransitioningRef.current = false
           setIsLoading(false)
         }
       } else {
@@ -1660,13 +1707,16 @@ export function SyncedVideoPlayer({
             setYouTubeVolume(volume)
             setIsMuted(false)
             setYouTubeMuted(false)
+            schedulePlaybackRecovery('initial-player-start')
           },
           onStateChange: (state) => {
             if (!mountedRef.current) return
+            lastPlayerStateRef.current = state
             
             console.log('🎬 YouTube state changed:', state)
             
             if (state === YT_STATE.ENDED) {
+              clearPlaybackRecoveryTimer()
               console.log('📺 22 Video ended event received - playing next')
               // setIsLoading(true)
               setShowBrandedOverlay(true)
@@ -1679,6 +1729,8 @@ export function SyncedVideoPlayer({
               playNextVideoRef.current()
             } else if (state === YT_STATE.PLAYING) {
               console.log('▶️ 22 Video is now playing')
+              clearPlaybackRecoveryTimer()
+              isTransitioningRef.current = false
               setIsLoading(false);
               setIframeVisible(true)
               setIsMuted(false)
@@ -1691,8 +1743,10 @@ export function SyncedVideoPlayer({
               play()
             } else if (state === YT_STATE.BUFFERING) {
               console.log('⏳ 22 Video buffering...')
+              schedulePlaybackRecovery('web-buffering')
             } else if (state === YT_STATE.CUED) {
               console.log('🎬 22 Video cued - playing')
+              schedulePlaybackRecovery('web-cued')
               play()
             }
           },
@@ -1704,6 +1758,8 @@ export function SyncedVideoPlayer({
           },
           onError: (code, msg) => {
             console.error('Player error:', code, msg)
+            clearPlaybackRecoveryTimer()
+            isTransitioningRef.current = false
             if (code === 2 || code === 5 || code === 100) {
               setApiError(`Playback error: ${msg}`)
               setIsLoading(false)
@@ -1717,10 +1773,12 @@ export function SyncedVideoPlayer({
       
     } catch (error) {
       console.error('API call failed:', error)
+      clearPlaybackRecoveryTimer()
+      isTransitioningRef.current = false
       setApiError(error instanceof Error ? error.message : 'Failed to load video')
       setIsLoading(false)
     }
-  }, [isLoading, playerReady, isPrimedRef, volume, initializePlayer, loadVideo, seekTo, play, setYouTubeVolume, setYouTubeMuted, onChannelChange, onStartClick, getDuration, fetchFromBrowserAPI, notifyParentScheduleChange])
+  }, [isLoading, playerReady, isPrimedRef, volume, initializePlayer, loadVideo, seekTo, play, setYouTubeVolume, setYouTubeMuted, onChannelChange, onStartClick, getDuration, fetchFromBrowserAPI, notifyParentScheduleChange, setPlayerCallbacks, schedulePlaybackRecovery, clearPlaybackRecoveryTimer])
 
   // Auto-load on web/android: iOS keeps explicit Start button.
   useEffect(() => {
@@ -1990,6 +2048,8 @@ export function SyncedVideoPlayer({
   const handleReload = useCallback(() => {
     if (!currentChannelId) return
     console.log('🔄 Reloading channel:', currentChannelId)
+    clearPlaybackRecoveryTimer()
+    isTransitioningRef.current = false
     
     // Save currently-playing video to history BEFORE reload so it appears in the list
     if (currentProgram) {
@@ -2008,7 +2068,7 @@ export function SyncedVideoPlayer({
     setTimeout(() => {
       loadChannel(currentChannelId)
     }, 200)
-  }, [destroy, currentChannelId, currentProgram, loadChannel])
+  }, [destroy, currentChannelId, currentProgram, loadChannel, clearPlaybackRecoveryTimer])
 
   // Trigger reload when parent increments the counter (e.g. Reload menu option)
   useEffect(() => {
@@ -2058,14 +2118,19 @@ export function SyncedVideoPlayer({
     
     // Load and play
     lastVideoIdRef.current = video.videoId
-    loadVideo(video.videoId, 0)
+    const loaded = loadVideo(video.videoId, 0)
+    if (!loaded) {
+      isTransitioningRef.current = false
+      setShowBrandedOverlay(false)
+      return
+    }
     
     setTimeout(() => {
       play()
-      isTransitioningRef.current = false
+      schedulePlaybackRecovery('play-from-history')
     }, 200)
     
-  }, [currentChannelId, playerReady, currentProgram, loadVideo, play])
+  }, [currentChannelId, playerReady, currentProgram, loadVideo, play, schedulePlaybackRecovery])
 
   // Fullscreen handlers
   const handleFullscreen = async () => {
@@ -2163,6 +2228,7 @@ export function SyncedVideoPlayer({
     
     return () => {
       mountedRef.current = false
+      clearPlaybackRecoveryTimer()
       if (syncIntervalRef.current) {
         clearInterval(syncIntervalRef.current)
       }
@@ -2174,7 +2240,7 @@ export function SyncedVideoPlayer({
       }
       //destroy()
     }
-  }, [destroy])
+  }, [destroy, clearPlaybackRecoveryTimer])
 
   const handleVolumeChange = useCallback((value: number[]) => {
     const newVolume = value[0]
