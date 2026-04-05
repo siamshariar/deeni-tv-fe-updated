@@ -53,6 +53,12 @@ export default withPWA({
         }
       },
       {
+        // Live playback endpoints must never come from SW cache.
+        // Stale seek/duration data can leave the wrapper in a loading loop after reload.
+        urlPattern: /\/api\/(?:current-video|live-schedule|upcoming-videos|sync-ping).*/i,
+        handler: 'NetworkOnly',
+      },
+      {
         urlPattern: /\/api\/.*/i,
         handler: 'NetworkFirst',
         options: {
